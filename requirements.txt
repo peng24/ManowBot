@@ -1,0 +1,6 @@
+PyQt5
+PyQtWebEngine
+yt-dlp
+groq
+python-dotenv
+requests
