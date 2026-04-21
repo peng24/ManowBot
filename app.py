@@ -5,10 +5,13 @@ PyQt5 GUI  ·  yt-dlp Audio Stream  ·  Groq AI Pipeline
 
 import sys
 import os
+import faulthandler
+faulthandler.enable(open("crash.log", "w"))
 import re
 import json
 import wave
 import subprocess
+import multiprocessing
 from io import BytesIO
 from datetime import datetime
 
@@ -17,9 +20,10 @@ from groq import Groq
 import requests
 from faster_whisper import WhisperModel
 
+import threading
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QUrl, QTimer, QSize, QPropertyAnimation,
-    QEasingCurve, pyqtProperty,
+    QEasingCurve, pyqtProperty, QObject
 )
 from PyQt5.QtGui import QFont, QColor, QPainter, QLinearGradient, QBrush, QPen, QIcon
 from PyQt5.QtWidgets import (
@@ -66,16 +70,30 @@ def now_str() -> str:
 #  AI Functions
 # ══════════════════════════════════════════════════════════════
 
-# โหลดโมเดล Whisper รอไว้ตั้งแต่เริ่มโปรแกรม (หน่วงเวลาตอนเปิดบอทนิดหน่อย)
-try:
-    print("Loading Local Whisper Model...")
-    whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
-    print("Whisper Model loaded successfully!")
-except Exception as e:
-    print(f"Warning: Failed to load Whisper on CUDA. Trying CPU fallback... ({e})")
-    whisper_model = WhisperModel("large-v3", device="cpu", compute_type="int8")
+whisper_model = None
+
+# Removed ModelLoaderThread because model is loaded synchronously via Splash screen
+def init_model_sync():
+    global whisper_model
+    try:
+        with open("debug.log", "w", encoding="utf-8") as f:
+            f.write("Loading start\n")
+        print("Loading Local Whisper Model...")
+        whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+        print("Whisper Model loaded successfully!")
+        with open("debug.log", "a", encoding="utf-8") as f:
+            f.write("Loading success\n")
+    except Exception as e:
+        print(f"Warning: Failed to load Whisper on CUDA. Trying CPU fallback... ({e})")
+        try:
+            whisper_model = WhisperModel("large-v3", device="cpu", compute_type="int8")
+        except Exception as e2:
+            print(f"Failed to load Whisper on CPU: {e2}")
 
 def transcribe_audio(wav_bytes: bytes) -> str:
+    if whisper_model is None:
+        print("Whisper model is not loaded yet!")
+        return ""
     try:
         audio_buffer = BytesIO(wav_bytes)
         segments, info = whisper_model.transcribe(audio_buffer, beam_size=5, language="th")
@@ -575,6 +593,40 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._start_clock()
+        self._start_model_loader()
+
+    def _start_model_loader(self):
+        # Already loaded synchronously in main()
+        self._on_model_loaded()
+
+    def _on_model_loaded(self):
+        if hasattr(self, 'web_view_layout') and self.web_view is None:
+            self.web_view = QWebEngineView()
+            self.web_view.setMinimumHeight(250)
+            settings = self.web_view.settings()
+            settings.setAttribute(QWebEngineSettings.PlaybackRequiresUserGesture, False)
+            self.web_view.setHtml("""
+                <html><body style="margin:0;background:#0d0d16;display:flex;
+                align-items:center;justify-content:center;height:100vh;
+                font-family:sans-serif;color:#3a3a55;">
+                <div style="text-align:center;">
+                    <div style="font-size:48px;margin-bottom:12px;">📺</div>
+                    <div style="font-size:13px;letter-spacing:1px;">
+                        วางลิงก์ YouTube Live แล้วกดปุ่มเริ่มทำงาน
+                    </div>
+                </div></body></html>
+            """)
+            self.web_view_layout.addWidget(self.web_view)
+
+        self.start_btn.setEnabled(True)
+        self.start_btn.setText("▶  เริ่มทำงาน")
+        self._set_status("idle")
+        self.sb_text.setText("พร้อมทำงาน (โหลดโมเดลสำเร็จ)")
+
+    def _on_model_error(self, err_msg):
+        self.start_btn.setText("❌ โหลดโมเดลไม่สำเร็จ")
+        self._set_status("error")
+        self.sb_text.setText(f"Error: โหลดโมเดลล้มเหลว")
 
     # ── Build UI ────────────────────────────────────────────
     def _build_ui(self):
@@ -674,23 +726,12 @@ class MainWindow(QMainWindow):
         web_header.setObjectName("sectionLabel")
         web_lay.addWidget(web_header)
 
-        self.web_view = QWebEngineView()
-        self.web_view.setMinimumHeight(250)
-        settings = self.web_view.settings()
-        settings.setAttribute(QWebEngineSettings.PlaybackRequiresUserGesture, False)
-        # blank page with dark bg
-        self.web_view.setHtml("""
-            <html><body style="margin:0;background:#0d0d16;display:flex;
-            align-items:center;justify-content:center;height:100vh;
-            font-family:sans-serif;color:#3a3a55;">
-            <div style="text-align:center;">
-                <div style="font-size:48px;margin-bottom:12px;">📺</div>
-                <div style="font-size:13px;letter-spacing:1px;">
-                    วางลิงก์ YouTube Live แล้วกดปุ่มเริ่มทำงาน
-                </div>
-            </div></body></html>
-        """)
-        web_lay.addWidget(self.web_view)
+        self.web_view_container = QWidget()
+        self.web_view_layout = QVBoxLayout(self.web_view_container)
+        self.web_view_layout.setContentsMargins(0, 0, 0, 0)
+        web_lay.addWidget(self.web_view_container)
+        
+        self.web_view = None
         web_card.setMaximumWidth(420)
         splitter.addWidget(web_card)
 
@@ -787,8 +828,9 @@ class MainWindow(QMainWindow):
             html_content = f"<html><body style='margin:0;background:#0d0d16;overflow:hidden;'><iframe width='100%' height='100%' src='{embed_url}' frameborder='0' allow='autoplay; encrypted-media' allowfullscreen></iframe></body></html>"
             
             # ตั้งค่า User-Agent ใหม่ให้เหมือน Chrome ปกติเพื่อป้องกันการบล็อคจาก YouTube
-            self.web_view.page().profile().setHttpUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            self.web_view.setHtml(html_content, QUrl("http://localhost"))
+            if self.web_view:
+                self.web_view.page().profile().setHttpUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                self.web_view.setHtml(html_content, QUrl("http://localhost"))
             self.log(f"โหลด YouTube Player — ID: {video_id}", "info")
         else:
             self.log("ไม่พบ Video ID จาก URL", "error")
@@ -832,18 +874,19 @@ class MainWindow(QMainWindow):
         self.sb_text.setText("พร้อมทำงาน")
         
         # รีเซ็ตหน้าวีดีโอกลับเป็นค่าเริ่มต้น (หยุดเล่นเสียงคลิป)
-        self.web_view.setUrl(QUrl("about:blank"))
-        self.web_view.setHtml("""
-            <html><body style="margin:0;background:#0d0d16;display:flex;
-            align-items:center;justify-content:center;height:100vh;
-            font-family:sans-serif;color:#3a3a55;">
-            <div style="text-align:center;">
-                <div style="font-size:48px;margin-bottom:12px;">📺</div>
-                <div style="font-size:13px;letter-spacing:1px;">
-                    วางลิงก์ YouTube Live แล้วกดปุ่มเริ่มทำงาน
-                </div>
-            </div></body></html>
-        """)
+        if hasattr(self, 'web_view') and self.web_view is not None:
+            self.web_view.setUrl(QUrl("about:blank"))
+            self.web_view.setHtml("""
+                <html><body style="margin:0;background:#0d0d16;display:flex;
+                align-items:center;justify-content:center;height:100vh;
+                font-family:sans-serif;color:#3a3a55;">
+                <div style="text-align:center;">
+                    <div style="font-size:48px;margin-bottom:12px;">📺</div>
+                    <div style="font-size:13px;letter-spacing:1px;">
+                        วางลิงก์ YouTube Live แล้วกดปุ่มเริ่มทำงาน
+                    </div>
+                </div></body></html>
+            """)
 
     def _set_status(self, status: str):
         self.status_dot.set_status(status)
@@ -967,14 +1010,45 @@ class MainWindow(QMainWindow):
 # ══════════════════════════════════════════════════════════════
 
 def main():
+    # ป้องกันบัคโปรแกรมดับ: ห้ามให้ QtWebEngine Child Processes สร้างหน้าต่างหรือโหลด AI ซ้ำซ้อน
+    is_web_child = any(arg.startswith("--type=") for arg in sys.argv)
+    
+    # Enable High DPI support
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    
     app = QApplication(sys.argv)
+    
+    if is_web_child:
+        sys.exit(app.exec_())
+
+    from PyQt5.QtWidgets import QSplashScreen
+    from PyQt5.QtGui import QPixmap
+
+    # Show Splash Screen
+    pixmap = QPixmap("icon.png").scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    if pixmap.isNull():
+        pixmap = QPixmap(300, 300)
+        pixmap.fill(QColor("#0f0f1a"))
+        
+    splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
+    splash.setFont(QFont("Segoe UI", 12, QFont.Bold))
+    splash.show()
+    splash.showMessage("กำลังโหลดโมเดล AI...", Qt.AlignBottom | Qt.AlignCenter, QColor("white"))
+    app.processEvents()
+
+    # Load Model Synchronously on main thread
+    init_model_sync()
+
     app.setStyleSheet(DARK_STYLE)
     app.setFont(QFont("Segoe UI", 10))
 
     window = MainWindow()
+    splash.finish(window)
     window.show()
     sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
