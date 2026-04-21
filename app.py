@@ -36,7 +36,7 @@ load_dotenv()
 SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK_DURATION = 5
-MAX_BUFFER_LEN = 150
+MAX_BUFFER_LEN = 300
 FIREBASE_URL = os.getenv("FIREBASE_URL", "")
 FIREBASE_AUTH = os.getenv("FIREBASE_AUTH", "")
 
@@ -866,19 +866,34 @@ class MainWindow(QMainWindow):
             self.log("ข้อมูล Firebase ใน .env ไม่ครบถ้วน", "warning")
             return
 
-        # Update stock price and size via PATCH
-        stock_url = f"https://{FIREBASE_URL}/stock/{video_id}/{item_id}.json?auth={FIREBASE_AUTH}"
-        stock_payload = {
+        clean_fb_url = FIREBASE_URL.replace("https://", "").rstrip("/")
+
+        # Update stock price via PATCH
+        stock_url = f"https://{clean_fb_url}/stock/{video_id}/{item_id}.json?auth={FIREBASE_AUTH}"
+        stock_payload = {"price": price}
+        if size:
+            stock_payload["size"] = size
+
+        # Update live overlay via PUT
+        overlay_url = f"https://{clean_fb_url}/overlay/{video_id}/current_item.json?auth={FIREBASE_AUTH}"
+        overlay_payload = {
+            "id": item_id,
             "price": price,
-            "size": size
+            "size": size if size else None,
+            "updatedAt": {".sv": "timestamp"}
         }
 
         # Send to Firebase
         try:
+            # Update Stock
             r_stock = requests.patch(stock_url, json=stock_payload, timeout=5)
             r_stock.raise_for_status()
 
-            self.log(f"อัปเดตรายการ {item_id} สำเร็จ (Status: {r_stock.status_code})", "success")
+            # Update Overlay
+            r_overlay = requests.put(overlay_url, json=overlay_payload, timeout=5)
+            r_overlay.raise_for_status()
+
+            self.log(f"อัปเดตรายการ {item_id} (Stock & Overlay) สำเร็จ", "success")
         except requests.RequestException as e:
             # Handle possible response object in exception for status code logging
             status_code = e.response.status_code if e.response is not None else "N/A"
