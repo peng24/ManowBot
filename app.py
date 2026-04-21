@@ -66,14 +66,18 @@ def now_str() -> str:
 # ══════════════════════════════════════════════════════════════
 
 def transcribe_audio(wav_bytes: bytes) -> str:
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    transcription = client.audio.transcriptions.create(
-        file=("chunk.wav", wav_bytes),
-        model="whisper-large-v3",
-        language="th",
-        response_format="text",
-    )
-    return transcription.strip() if transcription else ""
+    try:
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        transcription = client.audio.transcriptions.create(
+            file=("chunk.wav", wav_bytes),
+            model="whisper-large-v3",
+            language="th",
+            response_format="text",
+        )
+        return transcription.strip() if transcription else ""
+    except Exception as e:
+        print(f"Error in transcribe_audio: {e}")
+        return ""
 
 
 def extract_data(text: str) -> dict | None:
@@ -104,23 +108,24 @@ def extract_data(text: str) -> dict | None:
 - ตอบกลับเป็น JSON เท่านั้น: {"item": number, "size": string|null, "price": number}
 - ถ้าหา item หรือ price ไม่เจอเลย ให้ตอบ: null"""
 
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text},
-        ],
-        temperature=0,
-        response_format={"type": "json_object"},
-    )
-
-    raw = response.choices[0].message.content.strip()
     try:
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+
+        raw = response.choices[0].message.content.strip()
         data = json.loads(raw)
         if data and data.get("item") is not None and data.get("price") is not None:
             return data
         return None
-    except json.JSONDecodeError:
+    except Exception as e:
+        print(f"Error in extract_data: {e}")
         return None
 
 
@@ -822,6 +827,7 @@ class MainWindow(QMainWindow):
         self.sb_text.setText("พร้อมทำงาน")
         
         # รีเซ็ตหน้าวีดีโอกลับเป็นค่าเริ่มต้น (หยุดเล่นเสียงคลิป)
+        self.web_view.setUrl(QUrl("about:blank"))
         self.web_view.setHtml("""
             <html><body style="margin:0;background:#0d0d16;display:flex;
             align-items:center;justify-content:center;height:100vh;
@@ -879,7 +885,7 @@ class MainWindow(QMainWindow):
         sb.setValue(sb.maximum())
 
         # chunk counter
-        if "Chunk" in msg:
+        if "กำลังถอดเสียง" in msg or "สแตนด์บาย" in msg:
             self.chunk_count += 1
             self.stat_chunks.set_value(str(self.chunk_count))
 
