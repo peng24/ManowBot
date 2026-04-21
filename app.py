@@ -37,10 +37,8 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK_DURATION = 5
 MAX_BUFFER_LEN = 150
-CLOUDFLARE_API_URL = os.getenv(
-    "CLOUDFLARE_API_URL",
-    "https://your-worker.your-subdomain.workers.dev/api/order",
-)
+FIREBASE_URL = os.getenv("FIREBASE_URL", "")
+FIREBASE_AUTH = os.getenv("FIREBASE_AUTH", "")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -848,17 +846,37 @@ class MainWindow(QMainWindow):
             "order"
         )
 
-        # Send to Cloudflare
+        item_id = data.get("item")
+        size = data.get("size", "")
+
+        url_text = self.url_input.text().strip()
+        video_id = extract_video_id(url_text)
+
+        if not video_id:
+            self.log("ไม่พบ Video ID สำหรับส่ง Firebase", "error")
+            return
+
+        if not FIREBASE_URL or not FIREBASE_AUTH:
+            self.log("ข้อมูล Firebase ใน .env ไม่ครบถ้วน", "warning")
+            return
+
+        # Update stock price and size via PATCH
+        stock_url = f"https://{FIREBASE_URL}/stock/{video_id}/{item_id}.json?auth={FIREBASE_AUTH}"
+        stock_payload = {
+            "price": price,
+            "size": size
+        }
+
+        # Send to Firebase
         try:
-            resp = requests.post(
-                CLOUDFLARE_API_URL,
-                json=data,
-                headers={"Content-Type": "application/json"},
-                timeout=5,
-            )
-            self.log(f"Sent to API → {resp.status_code}", "success")
+            r_stock = requests.patch(stock_url, json=stock_payload, timeout=5)
+            r_stock.raise_for_status()
+
+            self.log(f"อัปเดตรายการ {item_id} สำเร็จ (Status: {r_stock.status_code})", "success")
         except requests.RequestException as e:
-            self.log(f"API error: {e}", "error")
+            # Handle possible response object in exception for status code logging
+            status_code = e.response.status_code if e.response is not None else "N/A"
+            self.log(f"อัปเดตรายการ {item_id} ไม่สำเร็จ (Status: {status_code}) - {e}", "error")
 
     # ── Close event ─────────────────────────────────────────
     def closeEvent(self, event):
