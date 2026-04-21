@@ -15,6 +15,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from groq import Groq
 import requests
+from faster_whisper import WhisperModel
 
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QUrl, QTimer, QSize, QPropertyAnimation,
@@ -35,7 +36,7 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════
 SAMPLE_RATE = 16000
 CHANNELS = 1
-CHUNK_DURATION = 5
+CHUNK_DURATION = 10
 MAX_BUFFER_LEN = 300
 FIREBASE_URL = os.getenv("FIREBASE_URL", "")
 FIREBASE_AUTH = os.getenv("FIREBASE_AUTH", "")
@@ -65,16 +66,21 @@ def now_str() -> str:
 #  AI Functions
 # ══════════════════════════════════════════════════════════════
 
+# โหลดโมเดล Whisper รอไว้ตั้งแต่เริ่มโปรแกรม (หน่วงเวลาตอนเปิดบอทนิดหน่อย)
+try:
+    print("Loading Local Whisper Model...")
+    whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+    print("Whisper Model loaded successfully!")
+except Exception as e:
+    print(f"Warning: Failed to load Whisper on CUDA. Trying CPU fallback... ({e})")
+    whisper_model = WhisperModel("large-v3", device="cpu", compute_type="int8")
+
 def transcribe_audio(wav_bytes: bytes) -> str:
     try:
-        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        transcription = client.audio.transcriptions.create(
-            file=("chunk.wav", wav_bytes),
-            model="whisper-large-v3",
-            language="th",
-            response_format="text",
-        )
-        return transcription.strip() if transcription else ""
+        audio_buffer = BytesIO(wav_bytes)
+        segments, info = whisper_model.transcribe(audio_buffer, beam_size=5, language="th")
+        text = " ".join([segment.text for segment in segments])
+        return text.strip()
     except Exception as e:
         print(f"Error in transcribe_audio: {e}")
         return ""
