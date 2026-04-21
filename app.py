@@ -20,7 +20,7 @@ from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QUrl, QTimer, QSize, QPropertyAnimation,
     QEasingCurve, pyqtProperty,
 )
-from PyQt5.QtGui import QFont, QColor, QPainter, QLinearGradient, QBrush, QPen
+from PyQt5.QtGui import QFont, QColor, QPainter, QLinearGradient, QBrush, QPen, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QTextEdit, QLabel, QSplitter, QFrame,
@@ -48,7 +48,7 @@ FIREBASE_AUTH = os.getenv("FIREBASE_AUTH", "")
 def extract_video_id(url: str) -> str | None:
     patterns = [
         r"(?:v=)([\w-]{11})", r"youtu\.be/([\w-]{11})",
-        r"embed/([\w-]{11})", r"live/([\w-]{11})",
+        r"embed/([\w-]{11})", r"live/([\w-]{11})", r"shorts/([\w-]{11})",
     ]
     for p in patterns:
         m = re.search(p, url)
@@ -105,7 +105,7 @@ def extract_data(text: str) -> dict | None:
 - ถ้าหา item หรือ price ไม่เจอเลย ให้ตอบ: null"""
 
     response = client.chat.completions.create(
-        model="llama3-8b-8192",
+        model="llama-3.1-8b-instant",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
@@ -168,6 +168,7 @@ class AudioWorker(QThread):
             self._process = subprocess.Popen(
                 [
                     "ffmpeg",
+                    "-re",
                     "-reconnect", "1",
                     "-reconnect_streamed", "1",
                     "-reconnect_delay_max", "5",
@@ -209,6 +210,21 @@ class AudioWorker(QThread):
                 wf.setframerate(SAMPLE_RATE)
                 wf.writeframes(raw_audio)
             wav_bytes = wav_buffer.getvalue()
+
+            wav_bytes = wav_buffer.getvalue()
+
+            # ป้องกัน AI มโนคำพูด (Hallucination) เวลาได้ยินเสียงเงียบ
+            import struct
+            import math
+            try:
+                samples = struct.unpack(f"<{len(raw_audio)//2}h", raw_audio)
+                rms = math.sqrt(sum(s*s for s in samples) / len(samples))
+            except Exception:
+                rms = 0
+                
+            if rms < 300: # ถ้าเสียงเบามากให้ข้ามไปเลย
+                self.log_signal.emit(f"[Chunk {chunk_num}] เงียบ (สแตนด์บาย) ...", "dim")
+                continue
 
             self.log_signal.emit(f"[Chunk {chunk_num}] กำลังถอดเสียง ...", "dim")
             try:
@@ -497,6 +513,15 @@ QSplitter::handle:vertical {
 QSplitter::handle:vertical:hover {
     background: rgba(108, 92, 231, 0.4);
 }
+QSplitter::handle:horizontal {
+    background: rgba(108, 92, 231, 0.15);
+    width: 3px;
+    margin: 40px 2px;
+    border-radius: 1px;
+}
+QSplitter::handle:horizontal:hover {
+    background: rgba(108, 92, 231, 0.4);
+}
 
 /* ── Scrollbar ── */
 QScrollBar:vertical {
@@ -529,6 +554,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ManowBot")
+        self.setWindowIcon(QIcon("icon.png"))
         self.setMinimumSize(1000, 740)
         self.resize(1100, 800)
 
@@ -559,7 +585,7 @@ class MainWindow(QMainWindow):
         title = QLabel("ManowBot")
         title.setObjectName("headerTitle")
         title_group.addWidget(title)
-        subtitle = QLabel("AI-Powered Live Order Extraction")
+        subtitle = QLabel("ระบบ AI ดึงออเดอร์ไลฟ์สด")
         subtitle.setObjectName("headerSub")
         title_group.addWidget(subtitle)
         header.addLayout(title_group)
@@ -570,7 +596,7 @@ class MainWindow(QMainWindow):
         status_container.setSpacing(6)
         self.status_dot = PulsingDot()
         status_container.addWidget(self.status_dot)
-        self.status_label = QLabel("Idle")
+        self.status_label = QLabel("รอทำงาน")
         self.status_label.setStyleSheet("color: #555566; font-size: 12px; font-weight: 600;")
         status_container.addWidget(self.status_label)
         header.addLayout(status_container)
@@ -586,11 +612,11 @@ class MainWindow(QMainWindow):
 
         self.url_input = QLineEdit()
         self.url_input.setObjectName("urlInput")
-        self.url_input.setPlaceholderText("Paste YouTube Live URL here ...")
+        self.url_input.setPlaceholderText("วางลิงก์ไลฟ์สด YouTube ที่นี่ ...")
         self.url_input.returnPressed.connect(self.toggle_stream)
         url_inner.addWidget(self.url_input)
 
-        self.start_btn = QPushButton("▶  START")
+        self.start_btn = QPushButton("▶  เริ่มทำงาน")
         self.start_btn.setObjectName("startBtn")
         self.start_btn.setCursor(Qt.PointingHandCursor)
         self.start_btn.clicked.connect(self.toggle_stream)
@@ -609,9 +635,9 @@ class MainWindow(QMainWindow):
         stats_row = QHBoxLayout()
         stats_row.setSpacing(10)
 
-        self.stat_orders = StatCard("📦", "ORDERS", "0", "#6c5ce7")
-        self.stat_chunks = StatCard("🎙", "CHUNKS", "0", "#00cec9")
-        self.stat_revenue = StatCard("💰", "REVENUE", "฿0", "#fdcb6e")
+        self.stat_orders = StatCard("📦", "ออเดอร์", "0", "#6c5ce7")
+        self.stat_chunks = StatCard("🎙", "รอบเสียง", "0", "#00cec9")
+        self.stat_revenue = StatCard("💰", "ยอดขาย", "฿0", "#fdcb6e")
 
         for card in [self.stat_orders, self.stat_chunks, self.stat_revenue]:
             shadow = QGraphicsDropShadowEffect()
@@ -624,7 +650,7 @@ class MainWindow(QMainWindow):
         root.addLayout(stats_row)
 
         # ── Main Content: Splitter (WebView + Log) ──
-        splitter = QSplitter(Qt.Vertical)
+        splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(6)
 
         # YouTube Card
@@ -634,7 +660,7 @@ class MainWindow(QMainWindow):
         web_lay.setContentsMargins(2, 2, 2, 2)
         web_lay.setSpacing(0)
 
-        web_header = QLabel("  LIVE PREVIEW")
+        web_header = QLabel("  แสดงภาพไลฟ์สด")
         web_header.setObjectName("sectionLabel")
         web_lay.addWidget(web_header)
 
@@ -650,11 +676,12 @@ class MainWindow(QMainWindow):
             <div style="text-align:center;">
                 <div style="font-size:48px;margin-bottom:12px;">📺</div>
                 <div style="font-size:13px;letter-spacing:1px;">
-                    Paste a YouTube Live URL and press START
+                    วางลิงก์ YouTube Live แล้วกดปุ่มเริ่มทำงาน
                 </div>
             </div></body></html>
         """)
         web_lay.addWidget(self.web_view)
+        web_card.setMaximumWidth(420)
         splitter.addWidget(web_card)
 
         # Log Card
@@ -665,12 +692,12 @@ class MainWindow(QMainWindow):
         log_lay.setSpacing(0)
 
         log_header_row = QHBoxLayout()
-        log_lbl = QLabel("  ACTIVITY LOG")
+        log_lbl = QLabel("  บันทึกการทำงาน")
         log_lbl.setObjectName("sectionLabel")
         log_header_row.addWidget(log_lbl)
         log_header_row.addStretch()
 
-        self.clear_btn = QPushButton("Clear")
+        self.clear_btn = QPushButton("ล้าง")
         self.clear_btn.setStyleSheet("""
             QPushButton {
                 background: transparent;
@@ -699,7 +726,9 @@ class MainWindow(QMainWindow):
         log_lay.addWidget(self.log_area)
         splitter.addWidget(log_card)
 
-        splitter.setSizes([380, 260])
+        splitter.setSizes([360, 740])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
         root.addWidget(splitter)
 
         # ── Status Bar ──
@@ -709,7 +738,7 @@ class MainWindow(QMainWindow):
         sb_layout = QHBoxLayout(status_bar)
         sb_layout.setContentsMargins(16, 0, 16, 0)
 
-        self.sb_text = QLabel("Ready")
+        self.sb_text = QLabel("พร้อมทำงาน")
         self.sb_text.setObjectName("statusText")
         sb_layout.addWidget(self.sb_text)
         sb_layout.addStretch()
@@ -743,11 +772,13 @@ class MainWindow(QMainWindow):
 
         video_id = extract_video_id(url)
         if video_id:
-            embed = (
-                f"https://www.youtube.com/embed/{video_id}"
-                f"?autoplay=1&mute=1&rel=0&modestbranding=1&controls=1"
-            )
-            self.web_view.setUrl(QUrl(embed))
+            # ใช้ youtube-nocookie ควบคู่กับ HTTP origin localhost เพื่อบายพาสข้อจำกัด 152-4
+            embed_url = f"https://www.youtube-nocookie.com/embed/{video_id}?autoplay=1&mute=1"
+            html_content = f"<html><body style='margin:0;background:#0d0d16;overflow:hidden;'><iframe width='100%' height='100%' src='{embed_url}' frameborder='0' allow='autoplay; encrypted-media' allowfullscreen></iframe></body></html>"
+            
+            # ตั้งค่า User-Agent ใหม่ให้เหมือน Chrome ปกติเพื่อป้องกันการบล็อคจาก YouTube
+            self.web_view.page().profile().setHttpUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            self.web_view.setHtml(html_content, QUrl("http://localhost"))
             self.log(f"โหลด YouTube Player — ID: {video_id}", "info")
         else:
             self.log("ไม่พบ Video ID จาก URL", "error")
@@ -766,11 +797,11 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.start()
 
-        self.start_btn.setText("⏹  STOP")
+        self.start_btn.setText("⏹  หยุดทำงาน")
         self.start_btn.setObjectName("stopBtn")
         self.start_btn.setStyle(self.start_btn.style())
         self.url_input.setEnabled(False)
-        self.sb_text.setText("Streaming ...")
+        self.sb_text.setText("กำลังดึงข้อมูล ...")
 
     def _stop_worker(self):
         if self.worker:
@@ -783,22 +814,35 @@ class MainWindow(QMainWindow):
         self._reset_ui()
 
     def _reset_ui(self):
-        self.start_btn.setText("▶  START")
+        self.start_btn.setText("▶  เริ่มทำงาน")
         self.start_btn.setObjectName("startBtn")
         self.start_btn.setStyle(self.start_btn.style())
         self.url_input.setEnabled(True)
         self._set_status("idle")
-        self.sb_text.setText("Ready")
+        self.sb_text.setText("พร้อมทำงาน")
+        
+        # รีเซ็ตหน้าวีดีโอกลับเป็นค่าเริ่มต้น (หยุดเล่นเสียงคลิป)
+        self.web_view.setHtml("""
+            <html><body style="margin:0;background:#0d0d16;display:flex;
+            align-items:center;justify-content:center;height:100vh;
+            font-family:sans-serif;color:#3a3a55;">
+            <div style="text-align:center;">
+                <div style="font-size:48px;margin-bottom:12px;">📺</div>
+                <div style="font-size:13px;letter-spacing:1px;">
+                    วางลิงก์ YouTube Live แล้วกดปุ่มเริ่มทำงาน
+                </div>
+            </div></body></html>
+        """)
 
     def _set_status(self, status: str):
         self.status_dot.set_status(status)
         labels = {
-            "idle": ("Idle", "#555566"),
-            "connecting": ("Connecting ...", "#f39c12"),
-            "streaming": ("Streaming", "#2ecc71"),
-            "error": ("Error", "#e74c3c"),
+            "idle": ("รอทำงาน", "#555566"),
+            "connecting": ("กำลังเชื่อมต่อ ...", "#f39c12"),
+            "streaming": ("กำลังวิเคราะห์เสียง", "#2ecc71"),
+            "error": ("เกิดข้อผิดพลาด", "#e74c3c"),
         }
-        text, color = labels.get(status, ("Idle", "#555566"))
+        text, color = labels.get(status, ("รอทำงาน", "#555566"))
         self.status_label.setText(text)
         self.status_label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
 
