@@ -1,26 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
-from PyInstaller.utils.hooks import copy_metadata
+import os
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 
-datas = []
+datas = [
+    ('.env', '.'),
+    ('icon.png', '.'),
+]
+
+# ค้นหา ffmpeg.exe ในโฟลเดอร์โปรเจกต์ ถ้ามีให้แถมไปด้วย
+if os.path.exists('ffmpeg.exe'):
+    datas.append(('ffmpeg.exe', '.'))
+
 binaries = []
-hiddenimports = ['dotenv']
-datas += copy_metadata('huggingface_hub')
-datas += copy_metadata('tokenizers')
-datas += copy_metadata('regex')
-datas += copy_metadata('requests')
-datas += copy_metadata('packaging')
-datas += copy_metadata('filelock')
-datas += copy_metadata('numpy')
-tmp_ret = collect_all('faster_whisper')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('ctranslate2')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('huggingface_hub')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('tokenizers')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+hiddenimports = ['dotenv', 'groq', 'requests', 'faster_whisper', 'ctranslate2']
 
+# รวบรวมข้อมูลที่จำเป็นสำหรับ faster_whisper และ ctranslate2
+for pkg in ['faster_whisper', 'ctranslate2', 'huggingface_hub', 'tokenizers', 'regex', 'requests', 'packaging', 'filelock', 'numpy']:
+    try:
+        datas += copy_metadata(pkg)
+    except:
+        pass
+    tmp_ret = collect_all(pkg)
+    datas += tmp_ret[0]
+    binaries += tmp_ret[1]
+    hiddenimports += tmp_ret[2]
 
 a = Analysis(
     ['app.py'],
@@ -47,7 +50,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,
+    console=True, # ตั้งเป็น False ถ้าต้องการปิดหน้าต่าง Console ดำๆ
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

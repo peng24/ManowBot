@@ -40,11 +40,10 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════
 SAMPLE_RATE = 16000
 CHANNELS = 1
-CHUNK_DURATION = 10
-MAX_BUFFER_LEN = 300
+CHUNK_DURATION = 8
+MAX_BUFFER_LEN = 400  # เพิ่มขนาด Buffer ให้ครอบคลุมบริบทมากขึ้น
 FIREBASE_URL = os.getenv("FIREBASE_URL", "")
 FIREBASE_AUTH = os.getenv("FIREBASE_AUTH", "")
-
 
 # ══════════════════════════════════════════════════════════════
 #  Helpers
@@ -61,6 +60,17 @@ def extract_video_id(url: str) -> str | None:
             return m.group(1)
     return None
 
+def trim_context(text: str, max_len: int) -> str:
+    """ตัดบริบทโดยไม่ให้คำขาดกลาง"""
+    if len(text) <= max_len:
+        return text
+    # หาช่องว่างแรกหลังจากตำแหน่งที่ต้องการตัด เพื่อไม่ให้ตัดคำไทย (ถ้ามีช่องว่าง)
+    # แต่ภาษาไทยมักไม่มีช่องว่าง ดังนั้นเราจะใช้การตัดย้อนกลับไปหาช่องว่างสุดท้ายแทน
+    truncated = text[-max_len:]
+    first_space = truncated.find(" ")
+    if first_space != -1:
+        return truncated[first_space:].strip()
+    return truncated
 
 def now_str() -> str:
     return datetime.now().strftime("%H:%M:%S")
@@ -72,94 +82,80 @@ def now_str() -> str:
 
 whisper_model = None
 
-# Removed ModelLoaderThread because model is loaded synchronously via Splash screen
 def init_model_sync():
     global whisper_model
     try:
-        with open("debug.log", "w", encoding="utf-8") as f:
-            f.write("Loading start\n")
-        print("Loading Local Whisper Model...")
+        print("Loading Local Whisper Model (large-v3)...")
+        # ใช้ compute_type="int8_float16" เพื่อประหยัดแรมและยังแม่นยำ
         whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
-        print("Whisper Model loaded successfully!")
-        with open("debug.log", "a", encoding="utf-8") as f:
-            f.write("Loading success\n")
+        print("Whisper Model loaded successfully on GPU!")
     except Exception as e:
-        print(f"Warning: Failed to load Whisper on CUDA. Trying CPU fallback... ({e})")
+        print(f"Warning: GPU failed ({e}). Fallback to CPU...")
         try:
             whisper_model = WhisperModel("large-v3", device="cpu", compute_type="int8")
+            print("Whisper Model loaded on CPU.")
         except Exception as e2:
-            print(f"Failed to load Whisper on CPU: {e2}")
+            print(f"CRITICAL: Failed to load Whisper: {e2}")
 
 def transcribe_audio(wav_bytes: bytes) -> str:
-    if whisper_model is None:
-        print("Whisper model is not loaded yet!")
-        return ""
+    if whisper_model is None: return ""
     try:
         audio_buffer = BytesIO(wav_bytes)
-        segments, info = whisper_model.transcribe(audio_buffer, beam_size=5, language="th")
-        text = " ".join([segment.text for segment in segments])
-        return text.strip()
+        segments, _ = whisper_model.transcribe(audio_buffer, beam_size=5, language="th")
+        return "".join([s.text for s in segments]).strip()
     except Exception as e:
         print(f"Error in transcribe_audio: {e}")
         return ""
 
+def extract_data(text: str, retries=2) -> dict | None:
+    if not text or len(text) < 5: return None
+    
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key: return None
+    
+    client = Groq(api_key=api_key)
+    system_prompt = """คุณเป็น AI ดึงออเดอร์เสื้อผ้า "ร้านมะนาวแซ่บ" (เน้นภาษาอีสานและคำแสลง)
+วิเคราะห์ข้อความและตอบเป็น JSON เท่านั้น: {"item": number|null, "size": string|null, "price": number|null}
 
-def extract_data(text: str) -> dict | None:
-    if not text:
-        return None
+กฎการสกัดข้อมูล:
+1. item (รหัสสินค้า): ตัวเลข 1-99
+2. price (ราคา): มักเป็น 50, 60, 100, 150 (เลือกราคาล่าสุดที่แม่ค้าสรุป)
+3. size (ไซส์): เช่น XL, 2XL, อก 44-46, เอว 32
 
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+⚠️ การแก้คำเพี้ยนจาก Whisper:
+- "ตัวเลขฟิวชั่น": "1160" -> รหัส 11 ราคา 60, "35100" -> รหัส 35 ราคา 100
+- "อก กลายเป็น 6": "648" -> อก 48, "650" -> อก 50
+- "ภาษาอีสาน": "หล่า" (หนู/น้อง), "ป้าด" (อุทาน), "สิเอา" (จะเอา) -> ไม่ต้องสนใจ ให้หาแค่ รหัส/ไซส์/ราคา
+- ถ้าข้อมูลไม่ชัดเจน ให้คืนค่า null ในฟิลด์นั้นๆ
+- ถ้าไม่พบ รหัสสินค้า และ ราคา พร้อมกัน ให้ตอบ null (ทั้งก้อน)"""
 
-    system_prompt = """คุณเป็น AI ขั้นเทพสำหรับดึงข้อมูลออเดอร์ไลฟ์สดเสื้อผ้าสาวอวบ "ร้านมะนาวแซ่บ"
-หน้าที่ของคุณคือดึง "รายการที่" (item), "ไซส์/สัดส่วน" (size) และ "ราคา" (price) จากข้อความ
-
-กฎเหล็ก (ต้องวิเคราะห์ข้อบกพร่องของระบบพิมพ์ตามเสียงด้วย):
-1. item: รหัสสินค้า (โดยปกติมีตั้งแต่ 1-60)
-2. price: ราคา (โดยปกติเป็นหลักสิบ เช่น 20, 30, 50, 60, 80, 100)
-3. size: สัดส่วนและไซส์ เช่น XL, 2XL (ถ้าได้ยิน 2x ให้แปลว่า 2XL), 3XL หรือ อก 48 ยาว 30 (ถ้าไม่พูดให้เป็น null)
-
-⚠️ กฎพิเศษสำหรับการแก้คำเพี้ยน (สำคัญมาก):
-- "ตัวเลขฟิวชั่น": ระบบเสียงมักถอดรหัส+ราคาติดกัน เช่น "1160" ให้คุณแยกเป็น รหัส 11 ราคา 60, "3860" คือ รหัส 38 ราคา 60, "750" คือ รหัส 7 ราคา 50, "480" คือ รหัส 4 ราคา 80
-- "อก กลายเป็น 6": คำว่า "อก" มักถูกพิมพ์ผิดเป็นเลข "6" เช่น "648" แปลว่า "อก 48" หรือ "654" แปลว่า "อก 54" ห้ามนำเลข 6 นำหน้ามาเป็นรหัสสินค้าเด็ดขาด!
-- "ราคาสุดท้าย": หากแม่ค้ามีการเปลี่ยนใจลดราคา เช่น "ตอนแรกขาย 100 เหลือ 80" หรือ "เอาไป 50 บาทพอ" ให้ใช้ "ราคาสุดท้าย" (ราคาที่ถูกกว่า) เสมอ
-
-ตัวอย่างการทำงาน:
-- "ราย การ ที่ 3860 บาท 64 8 ยาว 30" → {"item": 38, "size": "อก 48 ยาว 30", "price": 60}
-- "ราย การ ที่ 1160 บาท ไซส์ 2x" → {"item": 11, "size": "2XL", "price": 60}
-- "ตัว นี้ 80 บาท เอา ไป 50 บาท พอ 654" → {"item": null, "size": "อก 54", "price": 50} 
-
-- ตอบกลับเป็น JSON เท่านั้น: {"item": number, "size": string|null, "price": number}
-- ถ้าหา item หรือ price ไม่เจอเลย ให้ตอบ: null"""
-
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
-
-        raw = response.choices[0].message.content.strip()
-        data = json.loads(raw)
-        if data and data.get("item") is not None and data.get("price") is not None:
-            return data
-        return None
-    except Exception as e:
-        print(f"Error in extract_data: {e}")
-        return None
-
+    for i in range(retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": text}],
+                temperature=0,
+                response_format={"type": "json_object"},
+                timeout=10
+            )
+            data = json.loads(response.choices[0].message.content)
+            # ต้องมีทั้งรหัสและราคาถึงจะถือว่าสมบูรณ์
+            if data and data.get("item") and data.get("price"):
+                return data
+            return None
+        except Exception as e:
+            if i == retries: print(f"LLM Final Error: {e}")
+            continue
+    return None
 
 # ══════════════════════════════════════════════════════════════
 #  Audio Worker Thread
 # ══════════════════════════════════════════════════════════════
 
 class AudioWorker(QThread):
-    log_signal = pyqtSignal(str, str)       # (msg, level)
+    log_signal = pyqtSignal(str, str)
     order_signal = pyqtSignal(dict)
-    status_signal = pyqtSignal(str)         # status text
+    status_signal = pyqtSignal(str)
 
     def __init__(self, youtube_url: str):
         super().__init__()
@@ -170,129 +166,89 @@ class AudioWorker(QThread):
     def stop(self):
         self._running = False
         if self._process:
-            try:
-                self._process.terminate()
-            except Exception:
-                pass
+            try: self._process.terminate()
+            except: pass
 
     def run(self):
         import yt_dlp
-
         self.status_signal.emit("connecting")
-        self.log_signal.emit("กำลังดึง Audio Stream URL ...", "info")
-
+        
         try:
-            ydl_opts = {"format": "bestaudio/best", "quiet": True, "no_warnings": True}
+            ydl_opts = {"format": "bestaudio/best", "quiet": True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(self.youtube_url, download=False)
                 audio_url = info["url"]
         except Exception as e:
-            self.log_signal.emit(f"yt-dlp error: {e}", "error")
+            self.log_signal.emit(f"การเชื่อมต่อล้มเหลว: {e}", "error")
             self.status_signal.emit("error")
             return
 
-        self.log_signal.emit("เริ่มดึงเสียงจาก Stream ผ่าน FFmpeg ...", "info")
-        try:
-            self._process = subprocess.Popen(
-                [
-                    "ffmpeg",
-                    "-re",
-                    "-reconnect", "1",
-                    "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "5",
-                    "-i", audio_url,
-                    "-f", "s16le",
-                    "-acodec", "pcm_s16le",
-                    "-ar", str(SAMPLE_RATE),
-                    "-ac", str(CHANNELS),
-                    "-loglevel", "quiet",
-                    "pipe:1",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            self.log_signal.emit("ไม่พบ FFmpeg — กรุณาติดตั้ง (ดู README.md)", "error")
-            self.status_signal.emit("error")
-            return
+        # ค้นหาตำแหน่ง FFmpeg (รองรับทั้งตอนเป็น .py และ .exe)
+        ffmpeg_bin = "ffmpeg"
+        if getattr(sys, 'frozen', False):
+            # ถ้าเป็น .exe ให้ลองหาในโฟลเดอร์เดียวกับ .exe หรือใน _MEI
+            base_path = sys._MEIPASS
+            bundled_ffmpeg = os.path.join(base_path, "ffmpeg.exe")
+            if os.path.exists(bundled_ffmpeg):
+                ffmpeg_bin = bundled_ffmpeg
+
+        self._process = subprocess.Popen(
+            [ffmpeg_bin, "-re", "-reconnect", "1", "-reconnect_streamed", "1", 
+             "-reconnect_delay_max", "5", "-i", audio_url, "-f", "s16le", 
+             "-acodec", "pcm_s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS), 
+             "-loglevel", "quiet", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
 
         self.status_signal.emit("streaming")
         chunk_bytes = SAMPLE_RATE * 2 * CHUNK_DURATION
         previous_text = ""
-        last_sent = None
-        chunk_num = 0
+        last_sent_key = None # ใช้ (item, price) เป็น key กันส่งซ้ำ
+        
+        import struct, math
 
         while self._running:
             raw_audio = self._process.stdout.read(chunk_bytes)
-            if not raw_audio or len(raw_audio) < chunk_bytes:
-                if self._running:
-                    self.log_signal.emit("Stream สิ้นสุดหรือขาดการเชื่อมต่อ", "warning")
-                break
+            if not raw_audio or len(raw_audio) < chunk_bytes: break
 
-            chunk_num += 1
+            # วัดระดับเสียง (RMS)
+            samples = struct.unpack(f"<{len(raw_audio)//2}h", raw_audio)
+            rms = math.sqrt(sum(s*s for s in samples) / len(samples))
+            
+            if rms < 350:
+                self.log_signal.emit("... (เงียบ) ...", "dim")
+                continue
 
+            self.log_signal.emit("กำลังประมวลผลเสียง...", "dim")
+            
             wav_buffer = BytesIO()
             with wave.open(wav_buffer, "wb") as wf:
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(2)
-                wf.setframerate(SAMPLE_RATE)
+                wf.setnchannels(CHANNELS); wf.setsampwidth(2); wf.setframerate(SAMPLE_RATE)
                 wf.writeframes(raw_audio)
-            wav_bytes = wav_buffer.getvalue()
+            
+            text = transcribe_audio(wav_buffer.getvalue())
+            if not text: continue
 
-            wav_bytes = wav_buffer.getvalue()
-
-            # ป้องกัน AI มโนคำพูด (Hallucination) เวลาได้ยินเสียงเงียบ
-            import struct
-            import math
-            try:
-                samples = struct.unpack(f"<{len(raw_audio)//2}h", raw_audio)
-                rms = math.sqrt(sum(s*s for s in samples) / len(samples))
-            except Exception:
-                rms = 0
-                
-            if rms < 300: # ถ้าเสียงเบามากให้ข้ามไปเลย
-                self.log_signal.emit(f"[Chunk {chunk_num}] เงียบ (สแตนด์บาย) ...", "dim")
-                continue
-
-            self.log_signal.emit(f"[Chunk {chunk_num}] กำลังถอดเสียง ...", "dim")
-            try:
-                text = transcribe_audio(wav_bytes)
-            except Exception as e:
-                self.log_signal.emit(f"Whisper error: {e}", "error")
-                continue
-
-            if not text:
-                self.log_signal.emit(f"[Chunk {chunk_num}] ไม่พบเสียงพูด", "dim")
-                continue
-
-            self.log_signal.emit(f"{text}", "speech")
-
+            self.log_signal.emit(text, "speech")
+            
+            # Context Buffering
             combined = f"{previous_text} {text}".strip()
-            if len(combined) > MAX_BUFFER_LEN:
-                combined = combined[-MAX_BUFFER_LEN:]
-
-            try:
-                data = extract_data(combined)
-            except Exception as e:
-                self.log_signal.emit(f"LLM error: {e}", "error")
-                previous_text = combined
-                continue
+            data = extract_data(combined)
 
             if data:
-                if data == last_sent:
-                    self.log_signal.emit("รายการซ้ำ — ข้าม", "dim")
-                else:
+                current_key = f"{data['item']}_{data['price']}"
+                if current_key != last_sent_key:
                     self.order_signal.emit(data)
-                    last_sent = data
-                previous_text = ""
+                    last_sent_key = current_key
+                else:
+                    self.log_signal.emit("รายการเดิม (ข้าม)", "dim")
+                previous_text = "" # เคลียร์ buffer เมื่อสกัดสำเร็จ
             else:
-                self.log_signal.emit("ข้อมูลไม่ครบ — เก็บไว้ทบรอบถัดไป", "dim")
-                previous_text = combined
+                previous_text = trim_context(combined, MAX_BUFFER_LEN)
 
-        if self._process:
-            self._process.terminate()
+        if self._process: self._process.terminate()
         self.status_signal.emit("idle")
-        self.log_signal.emit("Audio Worker หยุดทำงาน", "info")
+
 
 
 # ══════════════════════════════════════════════════════════════
