@@ -30,6 +30,7 @@ desktop.ini
 # ── Audio temp files ──
 *.wav
 *.mp3
+ffmpeg.exe
 
 # ── Logs ──
 *.log
